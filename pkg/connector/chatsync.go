@@ -240,7 +240,7 @@ func subtractLimit(limit, count int) int {
 func (tc *TelegramClient) resetPinnedDialogs(ctx context.Context, dialogs []tg.DialogClass) error {
 	tc.metadata.PinnedDialogs = nil
 	for _, dialog := range dialogs {
-		if dialog.GetPinned() {
+		if dialog.GetPinned() && !isArchived(dialog) {
 			portalKey := tc.dialogToPortalKey(dialog)
 			tc.metadata.PinnedDialogs = append(tc.metadata.PinnedDialogs, portalKey.ID)
 		}
