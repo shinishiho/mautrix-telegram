@@ -132,6 +132,13 @@ type TelegramClient struct {
 
 	forbiddenSenderChecks *exsync.Map[string, time.Time]
 
+	groupNotifyLock sync.Mutex
+	groupNotify     map[int64]cachedNotifySettings
+
+	// pinnedDialogsLock guards metadata.PinnedDialogs, which updates and dialog
+	// syncs change from different goroutines.
+	pinnedDialogsLock sync.Mutex
+
 	takeoutLock        sync.Mutex
 	takeoutAccepted    *exsync.Event
 	stopTakeoutTimer   *time.Timer

@@ -238,14 +238,25 @@ func subtractLimit(limit, count int) int {
 }
 
 func (tc *TelegramClient) resetPinnedDialogs(ctx context.Context, dialogs []tg.DialogClass) error {
-	tc.metadata.PinnedDialogs = nil
+	pinned := tc.pinnedDialogIDs(dialogs)
+	return tc.updatePinnedDialogs(ctx, func([]networkid.PortalID) []networkid.PortalID {
+		return pinned
+	})
+}
+
+func (tc *TelegramClient) pinnedDialogIDs(dialogs []tg.DialogClass) []networkid.PortalID {
+	var pinned []networkid.PortalID
 	for _, dialog := range dialogs {
-		if dialog.GetPinned() && !isArchived(dialog) {
-			portalKey := tc.dialogToPortalKey(dialog)
-			tc.metadata.PinnedDialogs = append(tc.metadata.PinnedDialogs, portalKey.ID)
+		switch dialog.(type) {
+		case *tg.Dialog, *tg.DialogCommunity:
+			// A pinned archive folder isn't a chat, and pins inside the archive
+			// aren't bridged.
+			if dialog.GetPinned() && !isArchived(dialog) {
+				pinned = append(pinned, tc.dialogToPortalKey(dialog).ID)
+			}
 		}
 	}
-	return tc.userLogin.Save(ctx)
+	return pinned
 }
 
 func (tc *TelegramClient) handleDialogs(
@@ -332,6 +343,7 @@ func (tc *TelegramClient) syncNormalDialog(
 	}
 
 	var chatInfo *bridgev2.ChatInfo
+	var forum *tg.Channel
 	switch peer := dialog.Peer.(type) {
 	case *tg.PeerUser:
 		switch user := users[peer.UserID].(type) {
@@ -354,8 +366,9 @@ func (tc *TelegramClient) syncNormalDialog(
 	case *tg.PeerChat:
 		switch chat := chats[peer.ChatID].(type) {
 		case *tg.Chat:
-			// Need to get full chat info to get the member list
-			chatInfo, err = tc.GetChatInfo(ctx, portal)
+			// Need to get full chat info to get the member list. The mute and
+			// tag come from the dialog below.
+			chatInfo, err = tc.getChatInfoWithRetry(ctx, portal)
 			if err != nil {
 				log.Warn().Err(err).Msg("Not syncing portal because chat info is unavailable")
 				return nil
@@ -384,6 +397,9 @@ func (tc *TelegramClient) syncNormalDialog(
 			err = tc.fillChannelMembers(ctx, mfm, chatInfo.Members)
 			if err != nil {
 				log.Err(err).Msg("Failed to get channel members")
+			}
+			if channel.Forum {
+				forum = channel
 			}
 		case *tg.ChannelForbidden:
 			log.Debug().
@@ -422,6 +438,11 @@ func (tc *TelegramClient) syncNormalDialog(
 	}
 
 	tc.fillUserLocalMeta(chatInfo, dialog)
+	if forum != nil && (portal.MXID == "" || !tc.main.Bridge.Config.MuteOnlyOnCreate) {
+		// The dialog has the group's mute, but the group's room is the General
+		// topic's, which may have its own.
+		tc.applyGeneralTopicMute(ctx, forum.AsInputPeer(), chatInfo)
+	}
 
 	res := tc.main.Bridge.QueueRemoteEvent(tc.userLogin, &simplevent.ChatResync{
 		ChatInfo: chatInfo,
