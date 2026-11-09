@@ -1539,49 +1539,82 @@ func (tc *TelegramClient) transferEmojisToMatrix(ctx context.Context, customEmoj
 	return
 }
 
+// generalTopicID is the ID of a forum's General topic. Its room is the group's
+// own portal rather than a topic portal.
+const generalTopicID = 1
+
+// forumTopicsBatchSize caps how many topics are fetched in one request.
+const forumTopicsBatchSize = 100
+
+func (tc *TelegramClient) forumTopicPortalKey(channelID int64, topicID int) networkid.PortalKey {
+	if topicID == generalTopicID {
+		topicID = 0
+	}
+	return tc.makePortalKeyFromID(ids.PeerTypeChannel, channelID, topicID)
+}
+
 func (tc *TelegramClient) onNotifySettings(ctx context.Context, e tg.Entities, update *tg.UpdateNotifySettings) error {
+	log := zerolog.Ctx(ctx)
 	var portalKey networkid.PortalKey
 	settings := update.NotifySettings
 	switch typedPeer := update.Peer.(type) {
 	case *tg.NotifyPeer:
 		portalKey = tc.makePortalKeyFromPeer(typedPeer.Peer, 0)
 		if channel, ok := typedPeer.Peer.(*tg.PeerChannel); ok {
-			tc.syncInheritedTopicMutes(ctx, channel.ChannelID, settings)
+			tc.cacheGroupNotifySettings(channel.ChannelID, settings)
+			if tc.syncInheritedTopicMutes(ctx, channel.ChannelID, settings) {
+				// The group's portal is the General topic's room, which was
+				// handled along with the other topics.
+				return nil
+			}
 		}
 	case *tg.NotifyForumTopic:
-		portalKey = tc.makePortalKeyFromPeer(typedPeer.Peer, typedPeer.TopMsgID)
-		peer, _, err := tc.inputPeerForPortalID(ctx, portalKey.ID)
-		if err == nil {
-			settings, err = tc.forumTopicNotifySettings(ctx, peer, settings)
-		}
-		if err != nil {
-			zerolog.Ctx(ctx).Err(err).Msg("Failed to get forum topic notification settings")
+		channel, ok := typedPeer.Peer.(*tg.PeerChannel)
+		if !ok {
+			log.Debug().Type("peer_type", typedPeer.Peer).Msg("Ignoring forum topic notify settings for non-channel peer")
 			return nil
 		}
+		portalKey = tc.forumTopicPortalKey(channel.ChannelID, typedPeer.TopMsgID)
+		if _, explicit := settings.GetMuteUntil(); !explicit {
+			// The topic's own mute was removed, so it follows the group again.
+			accessHash, err := tc.ScopedStore.GetAccessHash(ctx, ids.PeerTypeChannel, channel.ChannelID)
+			if err == nil {
+				settings, err = tc.groupNotifySettings(ctx, &tg.InputPeerChannel{ChannelID: channel.ChannelID, AccessHash: accessHash})
+			}
+			if err != nil {
+				log.Err(err).Msg("Failed to get forum group notification settings")
+				return nil
+			}
+		}
 	default:
-		zerolog.Ctx(ctx).Debug().
+		log.Debug().
 			Type("peer_type", update.Peer).
 			Any("peer", update.Peer).
 			Msg("Ignoring unsupported notify settings peer type")
 		return nil
 	}
+	return tc.queueUserLocalChange(portalKey, &bridgev2.UserLocalPortalInfo{MutedUntil: notifyMutedUntil(settings)}, "updateNotifySettings")
+}
 
-	mutedUntil := notifyMutedUntil(settings)
+// queueUserLocalChange queues a change to the user's own settings for a room,
+// such as its mute or tag.
+func (tc *TelegramClient) queueUserLocalChange(portalKey networkid.PortalKey, userLocal *bridgev2.UserLocalPortalInfo, tgEvent string) error {
 	res := tc.main.Bridge.QueueRemoteEvent(tc.userLogin, &simplevent.ChatInfoChange{
 		ChatInfoChange: &bridgev2.ChatInfoChange{
-			ChatInfo: &bridgev2.ChatInfo{
-				UserLocal: &bridgev2.UserLocalPortalInfo{
-					MutedUntil: mutedUntil,
-				},
-			},
+			ChatInfo: &bridgev2.ChatInfo{UserLocal: userLocal},
 		},
 		EventMeta: simplevent.EventMeta{
 			Type:      bridgev2.RemoteEventChatInfoChange,
 			PortalKey: portalKey,
 			LogContext: func(c zerolog.Context) zerolog.Context {
-				return c.
-					Str("tg_event", "updateNotifySettings").
-					Time("muted_until", *mutedUntil)
+				c = c.Str("tg_event", tgEvent)
+				if userLocal.MutedUntil != nil {
+					c = c.Time("muted_until", *userLocal.MutedUntil)
+				}
+				if userLocal.Tag != nil {
+					c = c.Str("tag", string(*userLocal.Tag))
+				}
+				return c
 			},
 		},
 	})
@@ -1597,76 +1630,117 @@ func notifyMutedUntil(settings tg.PeerNotifySettings) *time.Time {
 
 // forumTopicNotifySettings returns the settings a forum topic follows: its own
 // mute if it has one, otherwise the group's.
-func (tc *TelegramClient) forumTopicNotifySettings(ctx context.Context, channel tg.InputPeerClass, topic tg.PeerNotifySettings) (tg.PeerNotifySettings, error) {
+func (tc *TelegramClient) forumTopicNotifySettings(ctx context.Context, channel *tg.InputPeerChannel, topic tg.PeerNotifySettings) (tg.PeerNotifySettings, error) {
 	if _, ok := topic.GetMuteUntil(); ok {
 		return topic, nil
 	}
-	group, err := tc.client.API().AccountGetNotifySettings(ctx, &tg.InputNotifyPeer{Peer: channel})
-	if err != nil {
-		return topic, err
-	}
-	return *group, nil
+	return tc.groupNotifySettings(ctx, channel)
 }
 
-// syncInheritedTopicMutes applies a forum group's new notification settings
-// to the topic rooms that don't have a mute of their own.
-func (tc *TelegramClient) syncInheritedTopicMutes(ctx context.Context, channelID int64, group tg.PeerNotifySettings) {
+// groupNotifyCacheTTL is how long a forum group's notification settings are
+// reused for its topics. Settings updates for the group refresh the cache, so
+// this only bounds how long a missed update goes unnoticed.
+const groupNotifyCacheTTL = 5 * time.Minute
+
+type cachedNotifySettings struct {
+	settings  tg.PeerNotifySettings
+	fetchedAt time.Time
+}
+
+// groupNotifySettings returns a forum group's notification settings. They're
+// cached because every topic room created in the group needs them.
+func (tc *TelegramClient) groupNotifySettings(ctx context.Context, channel *tg.InputPeerChannel) (tg.PeerNotifySettings, error) {
+	tc.groupNotifyLock.Lock()
+	defer tc.groupNotifyLock.Unlock()
+	if cached, ok := tc.groupNotify[channel.ChannelID]; ok && time.Since(cached.fetchedAt) < groupNotifyCacheTTL {
+		return cached.settings, nil
+	}
+	settings, err := tc.client.API().AccountGetNotifySettings(ctx, &tg.InputNotifyPeer{Peer: channel})
+	if err != nil {
+		return tg.PeerNotifySettings{}, err
+	}
+	tc.cacheGroupNotifySettingsLocked(channel.ChannelID, *settings)
+	return *settings, nil
+}
+
+func (tc *TelegramClient) cacheGroupNotifySettings(channelID int64, settings tg.PeerNotifySettings) {
+	tc.groupNotifyLock.Lock()
+	defer tc.groupNotifyLock.Unlock()
+	tc.cacheGroupNotifySettingsLocked(channelID, settings)
+}
+
+func (tc *TelegramClient) cacheGroupNotifySettingsLocked(channelID int64, settings tg.PeerNotifySettings) {
+	if tc.groupNotify == nil {
+		tc.groupNotify = make(map[int64]cachedNotifySettings)
+	}
+	tc.groupNotify[channelID] = cachedNotifySettings{settings: settings, fetchedAt: time.Now()}
+}
+
+// syncInheritedTopicMutes applies a forum group's new notification settings to
+// the rooms of topics that don't have their own mute, including the General
+// topic, whose room is the group's portal. It returns whether the General room
+// was handled. If not, because the group isn't a bridged forum or its topics
+// couldn't be read, the caller applies the settings to the group's portal.
+func (tc *TelegramClient) syncInheritedTopicMutes(ctx context.Context, channelID int64, group tg.PeerNotifySettings) (handledGeneral bool) {
 	log := zerolog.Ctx(ctx).With().Int64("channel_id", channelID).Logger()
-	children, err := tc.main.Bridge.GetChildPortals(ctx, tc.makePortalKeyFromID(ids.PeerTypeChannel, channelID, ids.TopicIDSpaceRoom))
+	// Only forums with bridged rooms have a space portal. Checking for it first
+	// keeps ordinary channels from loading child portals on every mute change.
+	spaceKey := tc.makePortalKeyFromID(ids.PeerTypeChannel, channelID, ids.TopicIDSpaceRoom)
+	if space, err := tc.main.Bridge.GetExistingPortalByKey(ctx, spaceKey); err != nil {
+		log.Err(err).Msg("Failed to get forum space portal")
+		return false
+	} else if space == nil {
+		return false
+	}
+	children, err := tc.main.Bridge.GetChildPortals(ctx, spaceKey)
 	if err != nil {
 		log.Err(err).Msg("Failed to get forum topic portals")
-		return
+		return false
 	}
 	var topicIDs []int
 	for _, child := range children {
-		if _, _, topicID, err := ids.ParsePortalID(child.ID); err == nil && topicID > 0 && child.MXID != "" {
-			topicIDs = append(topicIDs, topicID)
+		_, _, topicID, err := ids.ParsePortalID(child.ID)
+		if err != nil || child.MXID == "" || topicID < 0 {
+			continue
+		} else if topicID == 0 {
+			topicID = generalTopicID
 		}
+		topicIDs = append(topicIDs, topicID)
 	}
 	if len(topicIDs) == 0 {
-		return
+		return false
 	}
 	peer, _, err := tc.inputPeerForPortalID(ctx, ids.MakePortalID(ids.PeerTypeChannel, channelID))
 	if err != nil {
 		log.Err(err).Msg("Failed to get input peer for forum topics")
-		return
-	}
-	resp, err := APICallWithUpdates(ctx, tc, func() (*tg.MessagesForumTopics, error) {
-		return tc.client.API().MessagesGetForumTopicsByID(ctx, &tg.MessagesGetForumTopicsByIDRequest{Peer: peer, Topics: topicIDs})
-	})
-	if err != nil {
-		log.Err(err).Msg("Failed to get forum topics")
-		return
+		return false
 	}
 	mutedUntil := notifyMutedUntil(group)
-	for _, t := range resp.Topics {
-		topic, ok := t.(*tg.ForumTopic)
-		if !ok {
-			continue
-		} else if _, explicit := topic.NotifySettings.GetMuteUntil(); explicit {
+	for batch := range slices.Chunk(topicIDs, forumTopicsBatchSize) {
+		resp, err := APICallWithUpdates(ctx, tc, func() (*tg.MessagesForumTopics, error) {
+			return tc.client.API().MessagesGetForumTopicsByID(ctx, &tg.MessagesGetForumTopicsByIDRequest{Peer: peer, Topics: batch})
+		})
+		if err != nil {
+			log.Err(err).Int("topic_count", len(batch)).Msg("Failed to get forum topics")
 			continue
 		}
-		res := tc.main.Bridge.QueueRemoteEvent(tc.userLogin, &simplevent.ChatInfoChange{
-			ChatInfoChange: &bridgev2.ChatInfoChange{
-				ChatInfo: &bridgev2.ChatInfo{
-					UserLocal: &bridgev2.UserLocalPortalInfo{MutedUntil: mutedUntil},
-				},
-			},
-			EventMeta: simplevent.EventMeta{
-				Type:      bridgev2.RemoteEventChatInfoChange,
-				PortalKey: tc.makePortalKeyFromID(ids.PeerTypeChannel, channelID, topic.ID),
-				LogContext: func(c zerolog.Context) zerolog.Context {
-					return c.
-						Str("tg_event", "updateNotifySettings").
-						Bool("inherited", true).
-						Time("muted_until", *mutedUntil)
-				},
-			},
-		})
-		if err = resultToError(res); err != nil {
-			log.Err(err).Int("topic_id", topic.ID).Msg("Failed to queue forum topic mute")
+		for _, t := range resp.Topics {
+			topic, ok := t.(*tg.ForumTopic)
+			if !ok {
+				continue
+			} else if topic.ID == generalTopicID {
+				handledGeneral = true
+			}
+			if _, explicit := topic.NotifySettings.GetMuteUntil(); explicit {
+				continue
+			}
+			err = tc.queueUserLocalChange(tc.forumTopicPortalKey(channelID, topic.ID), &bridgev2.UserLocalPortalInfo{MutedUntil: mutedUntil}, "updateNotifySettings")
+			if err != nil {
+				log.Err(err).Int("topic_id", topic.ID).Msg("Failed to queue forum topic mute")
+			}
 		}
 	}
+	return handledGeneral
 }
 
 func (tc *TelegramClient) onPinnedDialogs(ctx context.Context, e tg.Entities, msg *tg.UpdatePinnedDialogs) error {
@@ -1674,135 +1748,248 @@ func (tc *TelegramClient) onPinnedDialogs(ctx context.Context, e tg.Entities, ms
 		// Pins inside the archive aren't bridged, archived chats are low priority.
 		return nil
 	}
-	order, ok := msg.GetOrder()
-	if !ok {
+	var pinned []networkid.PortalKey
+	if order, ok := msg.GetOrder(); ok {
+		for _, d := range order {
+			if portalKey, ok := tc.dialogPeerPortalKey(d); ok {
+				pinned = append(pinned, portalKey)
+			}
+		}
+	} else {
 		// Telegram omits the order when the client should refetch it.
-		pinned, err := tc.client.API().MessagesGetPinnedDialogs(ctx, 0)
+		resp, err := tc.client.API().MessagesGetPinnedDialogs(ctx, 0)
 		if err != nil {
 			return err
 		}
-		for _, d := range pinned.Dialogs {
-			if dialog, ok := d.(*tg.Dialog); ok {
-				order = append(order, &tg.DialogPeer{Peer: dialog.Peer})
+		for _, d := range resp.Dialogs {
+			switch d.(type) {
+			case *tg.Dialog, *tg.DialogCommunity:
+				pinned = append(pinned, tc.dialogToPortalKey(d))
 			}
 		}
 	}
 
-	needsUnpinning := map[networkid.PortalKey]struct{}{}
-	for _, portalID := range tc.metadata.PinnedDialogs {
-		pt, id, _, err := ids.ParsePortalID(portalID)
-		if err != nil {
-			return err
-		}
-		needsUnpinning[tc.makePortalKeyFromID(pt, id, 0)] = struct{}{}
+	favourites := make(map[networkid.PortalKey]event.RoomTag, len(pinned))
+	pinnedIDs := make([]networkid.PortalID, 0, len(pinned))
+	for _, portalKey := range pinned {
+		favourites[portalKey] = event.RoomTagFavourite
+		pinnedIDs = append(pinnedIDs, portalKey.ID)
 	}
-	tc.metadata.PinnedDialogs = nil
-
-	for _, d := range order {
-		dialog, ok := d.(*tg.DialogPeer)
-		if !ok {
+	var previous []networkid.PortalID
+	saveErr := tc.updatePinnedDialogs(ctx, func(old []networkid.PortalID) []networkid.PortalID {
+		previous = old
+		return pinnedIDs
+	})
+	needsUnpinning := map[networkid.PortalKey]event.RoomTag{}
+	for _, portalID := range previous {
+		if slices.Contains(pinnedIDs, portalID) {
 			continue
 		}
-		portalKey := tc.makePortalKeyFromPeer(dialog.Peer, 0)
-		delete(needsUnpinning, portalKey)
-		tc.metadata.PinnedDialogs = append(tc.metadata.PinnedDialogs, portalKey.ID)
-
-		res := tc.main.Bridge.QueueRemoteEvent(tc.userLogin, &simplevent.ChatInfoChange{
-			ChatInfoChange: &bridgev2.ChatInfoChange{
-				ChatInfo: &bridgev2.ChatInfo{
-					UserLocal: &bridgev2.UserLocalPortalInfo{
-						Tag: ptr.Ptr(event.RoomTagFavourite),
-					},
-				},
-			},
-			EventMeta: simplevent.EventMeta{
-				Type:      bridgev2.RemoteEventChatInfoChange,
-				PortalKey: portalKey,
-				LogContext: func(c zerolog.Context) zerolog.Context {
-					return c.
-						Str("tg_event", "updatePinnedDialogs").
-						Bool("pinned", true)
-				},
-			},
-		})
-		if err := resultToError(res); err != nil {
-			return err
+		pt, id, _, err := ids.ParsePortalID(portalID)
+		if err != nil {
+			zerolog.Ctx(ctx).Err(err).Str("portal_id", string(portalID)).Msg("Failed to parse previously pinned portal ID")
+			continue
 		}
+		needsUnpinning[tc.makePortalKeyFromID(pt, id, 0)] = ""
 	}
 
-	// Unpinned chats may have been archived, so check their current state.
-	for portalKey := range needsUnpinning {
-		tc.syncDialogTags(ctx, portalKey)
-	}
-
-	return tc.userLogin.Save(ctx)
+	// Unpinned chats may have been archived, so their current state is read back.
+	return errors.Join(
+		saveErr,
+		tc.syncDialogTags(ctx, favourites, false),
+		tc.syncDialogTags(ctx, needsUnpinning, true),
+	)
 }
 
 func (tc *TelegramClient) onDialogPinned(ctx context.Context, update *tg.UpdateDialogPinned) error {
-	dialog, ok := update.Peer.(*tg.DialogPeer)
+	portalKey, ok := tc.dialogPeerPortalKey(update.Peer)
 	if !ok || update.FolderID != 0 {
 		// Pinned folders and pins inside the archive aren't bridged.
 		return nil
 	}
-	portalKey := tc.makePortalKeyFromPeer(dialog.Peer, 0)
-	tc.metadata.PinnedDialogs = slices.DeleteFunc(tc.metadata.PinnedDialogs, func(id networkid.PortalID) bool {
-		return id == portalKey.ID
-	})
+	var tag event.RoomTag
 	if update.Pinned {
-		tc.metadata.PinnedDialogs = append(tc.metadata.PinnedDialogs, portalKey.ID)
+		tag = event.RoomTagFavourite
 	}
-	tc.syncDialogTags(ctx, portalKey)
-	return tc.userLogin.Save(ctx)
+	saveErr := tc.updatePinnedDialogs(ctx, func(pinned []networkid.PortalID) []networkid.PortalID {
+		return setPinned(pinned, portalKey.ID, update.Pinned)
+	})
+	return errors.Join(saveErr, tc.syncDialogTags(ctx, map[networkid.PortalKey]event.RoomTag{portalKey: tag}, true))
 }
 
 func (tc *TelegramClient) onFolderPeers(ctx context.Context, update *tg.UpdateFolderPeers) error {
+	archived := map[networkid.PortalKey]event.RoomTag{}
+	unarchived := map[networkid.PortalKey]event.RoomTag{}
 	for _, folderPeer := range update.FolderPeers {
-		tc.syncDialogTags(ctx, tc.makePortalKeyFromPeer(folderPeer.Peer, 0))
+		portalKey := tc.makePortalKeyFromPeer(folderPeer.Peer, 0)
+		if folderPeer.FolderID == archiveFolderID {
+			archived[portalKey] = event.RoomTagLowPriority
+		} else {
+			unarchived[portalKey] = ""
+		}
 	}
-	return nil
+	// Archived chats are low priority whether or not they're pinned inside the
+	// archive, but unarchived chats may already be pinned again.
+	return errors.Join(
+		tc.syncDialogTags(ctx, archived, false),
+		tc.syncDialogTags(ctx, unarchived, true),
+	)
 }
 
-// syncDialogTags bridges the current archive and pin state of the given chats.
-// Telegram sends folder and pin changes as separate updates in no particular
-// order, so the state is read back rather than derived from a single update.
-func (tc *TelegramClient) syncDialogTags(ctx context.Context, portalKeys ...networkid.PortalKey) {
-	for _, portalKey := range portalKeys {
-		log := zerolog.Ctx(ctx).With().Str("portal_id", string(portalKey.ID)).Logger()
-		peer, _, err := tc.inputPeerForPortalID(ctx, portalKey.ID)
+// updatePinnedDialogs changes the list of chats that are tagged favourite
+// because they're pinned, which decides what to untag when the pinned list
+// changes, and saves it.
+func (tc *TelegramClient) updatePinnedDialogs(ctx context.Context, fn func(pinned []networkid.PortalID) []networkid.PortalID) error {
+	tc.pinnedDialogsLock.Lock()
+	defer tc.pinnedDialogsLock.Unlock()
+	// fn gets a copy, so the list a concurrent save may be reading is never
+	// changed in place.
+	tc.metadata.PinnedDialogs = fn(slices.Clone(tc.metadata.PinnedDialogs))
+	return tc.userLogin.Save(ctx)
+}
+
+func setPinned(pinned []networkid.PortalID, portalID networkid.PortalID, isPinned bool) []networkid.PortalID {
+	pinned = slices.DeleteFunc(pinned, func(id networkid.PortalID) bool {
+		return id == portalID
+	})
+	if isPinned {
+		pinned = append(pinned, portalID)
+	}
+	return pinned
+}
+
+// dialogPeerPortalKey returns the portal key of a chat in the pinned dialog
+// list. Folders have no portal.
+func (tc *TelegramClient) dialogPeerPortalKey(peer tg.DialogPeerClass) (networkid.PortalKey, bool) {
+	switch p := peer.(type) {
+	case *tg.DialogPeer:
+		return tc.makePortalKeyFromPeer(p.Peer, 0), true
+	case *tg.DialogPeerCommunity:
+		return tc.makePortalKeyFromID(ids.PeerTypeChannel, p.CommunityID, 0), true
+	default:
+		return networkid.PortalKey{}, false
+	}
+}
+
+// inputDialogPeer returns the peer that refers to a chat in the dialog list.
+func (tc *TelegramClient) inputDialogPeer(ctx context.Context, portal *bridgev2.Portal) (tg.InputDialogPeerClass, error) {
+	peer, topicID, err := tc.inputPeerForPortalID(ctx, portal.ID)
+	if err != nil {
+		return nil, err
+	} else if topicID != 0 {
+		return nil, fmt.Errorf("topics aren't in the dialog list")
+	}
+	if meta, ok := portal.Metadata.(*PortalMetadata); ok && meta.IsCommunity {
+		channel, ok := peer.(*tg.InputPeerChannel)
+		if !ok {
+			return nil, fmt.Errorf("unexpected community peer type %T", peer)
+		}
+		return &tg.InputDialogPeerCommunity{Community: &tg.InputChannel{
+			ChannelID:  channel.ChannelID,
+			AccessHash: channel.AccessHash,
+		}}, nil
+	}
+	return &tg.InputDialogPeer{Peer: peer}, nil
+}
+
+// getPeerDialogsBatchSize caps how many chats are read back in one request.
+const getPeerDialogsBatchSize = 100
+
+// syncDialogTags sets the room tags of the given chats and records which ones
+// are tagged favourite. Telegram sends folder and pin changes as separate
+// updates in no particular order, so with readBack the current state of chats
+// with rooms is fetched, and the given tags are only used for chats whose
+// state can't be read. Chats whose room is still being created are included,
+// since their tag is applied once the room exists.
+func (tc *TelegramClient) syncDialogTags(ctx context.Context, tags map[networkid.PortalKey]event.RoomTag, readBack bool) error {
+	log := zerolog.Ctx(ctx)
+	portals := make(map[networkid.PortalKey]*bridgev2.Portal, len(tags))
+	withRooms := make(map[networkid.PortalKey]*bridgev2.Portal, len(tags))
+	for portalKey := range tags {
+		portal, err := tc.main.Bridge.GetExistingPortalByKey(ctx, portalKey)
 		if err != nil {
-			log.Err(err).Msg("Failed to get input peer to sync room tag")
+			log.Err(err).Str("portal_id", string(portalKey.ID)).Msg("Failed to get portal to sync room tag")
+		} else if portal != nil {
+			portals[portalKey] = portal
+			if portal.MXID != "" {
+				withRooms[portalKey] = portal
+			}
+		}
+	}
+	if len(portals) == 0 {
+		return nil
+	}
+	var current map[networkid.PortalKey]event.RoomTag
+	if readBack && len(withRooms) > 0 {
+		current = tc.readDialogTags(ctx, withRooms)
+	}
+	var errs []error
+	resolved := make(map[networkid.PortalKey]event.RoomTag, len(portals))
+	for portalKey := range portals {
+		expected := tags[portalKey]
+		tag, ok := current[portalKey]
+		if !ok {
+			tag = expected
+			if readBack && withRooms[portalKey] != nil {
+				log.Debug().
+					Str("portal_id", string(portalKey.ID)).
+					Str("tag", string(tag)).
+					Msg("Couldn't read dialog state, using tag from update")
+			}
+		}
+		resolved[portalKey] = tag
+		if err := tc.queueUserLocalChange(portalKey, &bridgev2.UserLocalPortalInfo{Tag: ptr.Ptr(tc.bridgedTag(tag, expected))}, "dialogTagSync"); err != nil {
+			errs = append(errs, fmt.Errorf("failed to queue room tag for %s: %w", portalKey.ID, err))
+		}
+	}
+	err := tc.updatePinnedDialogs(ctx, func(pinned []networkid.PortalID) []networkid.PortalID {
+		for portalKey, tag := range resolved {
+			pinned = setPinned(pinned, portalKey.ID, tag == event.RoomTagFavourite)
+		}
+		return pinned
+	})
+	return errors.Join(append(errs, err)...)
+}
+
+// bridgedTag returns the tag to send for a chat's state, given the tag that the
+// update itself implies. A tag that isn't bridged would be dropped, leaving the
+// room with the tag of the chat's previous state, like favourite after a
+// pinned chat is archived when only favourites are bridged. Such states clear
+// the bridged tags instead, except for pins, which have nothing to clear.
+func (tc *TelegramClient) bridgedTag(tag, expected event.RoomTag) event.RoomTag {
+	if tag != "" && expected != event.RoomTagFavourite && !slices.Contains(tc.main.Bridge.Config.OnlyBridgeTags, tag) {
+		return ""
+	}
+	return tag
+}
+
+// readDialogTags fetches the current tag of the given chats in as few requests
+// as possible. Chats whose state couldn't be read are left out of the result.
+func (tc *TelegramClient) readDialogTags(ctx context.Context, portals map[networkid.PortalKey]*bridgev2.Portal) map[networkid.PortalKey]event.RoomTag {
+	log := zerolog.Ctx(ctx)
+	peers := make([]tg.InputDialogPeerClass, 0, len(portals))
+	for _, portal := range portals {
+		peer, err := tc.inputDialogPeer(ctx, portal)
+		if err != nil {
+			log.Err(err).Str("portal_id", string(portal.ID)).Msg("Failed to get input peer to sync room tag")
 			continue
 		}
-		resp, err := tc.client.API().MessagesGetPeerDialogs(ctx, []tg.InputDialogPeerClass{&tg.InputDialogPeer{Peer: peer}})
+		peers = append(peers, peer)
+	}
+	tags := make(map[networkid.PortalKey]event.RoomTag, len(peers))
+	for batch := range slices.Chunk(peers, getPeerDialogsBatchSize) {
+		resp, err := tc.client.API().MessagesGetPeerDialogs(ctx, batch)
 		if err != nil {
-			log.Err(err).Msg("Failed to get dialog to sync room tag")
+			log.Err(err).Int("chat_count", len(batch)).Msg("Failed to get dialogs to sync room tags")
 			continue
 		}
 		for _, d := range resp.Dialogs {
-			dialog, ok := d.(*tg.Dialog)
-			if !ok {
-				continue
-			}
-			tag := dialogTag(dialog)
-			res := tc.main.Bridge.QueueRemoteEvent(tc.userLogin, &simplevent.ChatInfoChange{
-				ChatInfoChange: &bridgev2.ChatInfoChange{
-					ChatInfo: &bridgev2.ChatInfo{
-						UserLocal: &bridgev2.UserLocalPortalInfo{Tag: &tag},
-					},
-				},
-				EventMeta: simplevent.EventMeta{
-					Type:      bridgev2.RemoteEventChatInfoChange,
-					PortalKey: portalKey,
-					LogContext: func(c zerolog.Context) zerolog.Context {
-						return c.Str("tg_event", "dialogTagSync").Str("tag", string(tag))
-					},
-				},
-			})
-			if err = resultToError(res); err != nil {
-				log.Err(err).Msg("Failed to queue room tag sync")
+			if dialog, ok := d.(userLocalDialog); ok {
+				tags[tc.dialogToPortalKey(dialog)] = dialogTag(dialog)
 			}
 		}
 	}
+	return tags
 }
 
 func (tc *TelegramClient) onChatDefaultBannedRights(ctx context.Context, entities tg.Entities, update *tg.UpdateChatDefaultBannedRights) error {

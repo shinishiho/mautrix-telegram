@@ -45,7 +45,6 @@ import (
 	"go.mau.fi/util/jsontime"
 	"go.mau.fi/util/variationselector"
 	"go.mau.fi/webp"
-	"golang.org/x/exp/maps"
 	_ "golang.org/x/image/webp"
 	"golang.org/x/net/html"
 	"maunium.net/go/mautrix"
@@ -1315,18 +1314,55 @@ func (tc *TelegramClient) HandleMute(ctx context.Context, msg *bridgev2.MatrixMu
 	return err
 }
 
+// HandleRoomTag applies Matrix tags the same way dialogTag maps them from
+// Telegram: low priority archives the chat, and favourite pins it unless it's
+// archived, since pins inside the archive aren't bridged.
 func (tc *TelegramClient) HandleRoomTag(ctx context.Context, msg *bridgev2.MatrixRoomTag) error {
-	inputPeer, topicID, err := tc.inputPeerForPortalID(ctx, msg.Portal.ID)
+	_, favourite := msg.Content.Tags[event.RoomTagFavourite]
+	_, lowPriority := msg.Content.Tags[event.RoomTagLowPriority]
+	if msg.PrevContent != nil {
+		_, wasFavourite := msg.PrevContent.Tags[event.RoomTagFavourite]
+		_, wasLowPriority := msg.PrevContent.Tags[event.RoomTagLowPriority]
+		if favourite == wasFavourite && lowPriority == wasLowPriority {
+			// Only tags that aren't bridged changed.
+			return nil
+		}
+	}
+	dialogPeer, err := tc.inputDialogPeer(ctx, msg.Portal)
 	if err != nil {
 		return err
-	} else if topicID > 0 {
-		return fmt.Errorf("topics can't be pinned for yourself")
 	}
+	resp, err := tc.client.API().MessagesGetPeerDialogs(ctx, []tg.InputDialogPeerClass{dialogPeer})
+	if err != nil {
+		return fmt.Errorf("failed to get current dialog state: %w", err)
+	} else if len(resp.Dialogs) == 0 {
+		return fmt.Errorf("chat isn't in the dialog list")
+	}
+	pinned := resp.Dialogs[0].GetPinned()
+	archived := isArchived(resp.Dialogs[0])
 
-	_, err = tc.client.API().MessagesToggleDialogPin(ctx, &tg.MessagesToggleDialogPinRequest{
-		Pinned: slices.Contains(maps.Keys(msg.Content.Tags), event.RoomTagFavourite),
-		Peer:   &tg.InputDialogPeer{Peer: inputPeer},
-	})
+	// Without the low priority tag bridged, archived chats have no tag on
+	// Matrix, so its absence doesn't mean the chat should be unarchived.
+	peer, canArchive := dialogPeer.(*tg.InputDialogPeer)
+	if canArchive && lowPriority != archived && slices.Contains(tc.main.Bridge.Config.OnlyBridgeTags, event.RoomTagLowPriority) {
+		folderID := 0
+		if lowPriority {
+			folderID = archiveFolderID
+		}
+		_, err = tc.client.API().FoldersEditPeerFolders(ctx, []tg.InputFolderPeer{{Peer: peer.Peer, FolderID: folderID}})
+		if err != nil {
+			return fmt.Errorf("failed to move chat to folder %d: %w", folderID, err)
+		}
+		archived = lowPriority
+		// Pins belong to a folder, so moving the chat unpins it.
+		pinned = false
+	}
+	if !archived && pinned != favourite {
+		_, err = tc.client.API().MessagesToggleDialogPin(ctx, &tg.MessagesToggleDialogPinRequest{
+			Pinned: favourite,
+			Peer:   dialogPeer,
+		})
+	}
 	return err
 }
 

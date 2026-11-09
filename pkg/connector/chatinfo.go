@@ -361,9 +361,10 @@ func (tc *TelegramClient) fillTopicMembers(ctx context.Context, channelID int64,
 	return nil
 }
 
+// userLocalDialog is a dialog of a chat, as opposed to a folder.
 type userLocalDialog interface {
+	tg.DialogClass
 	GetNotifySettings() tg.PeerNotifySettings
-	GetPinned() bool
 }
 
 var (
@@ -372,22 +373,79 @@ var (
 )
 
 func (tc *TelegramClient) fillUserLocalMeta(info *bridgev2.ChatInfo, dialog userLocalDialog) {
-	info.UserLocal = &bridgev2.UserLocalPortalInfo{}
-	notifySettings := dialog.GetNotifySettings()
-	if mu, ok := notifySettings.GetMuteUntil(); ok {
-		info.UserLocal.MutedUntil = ptr.Ptr(time.Unix(int64(mu), 0))
-	} else {
-		info.UserLocal.MutedUntil = &bridgev2.Unmuted
+	info.UserLocal = &bridgev2.UserLocalPortalInfo{
+		MutedUntil: notifyMutedUntil(dialog.GetNotifySettings()),
 	}
 	if tag := dialogTag(dialog); tag != "" {
 		info.UserLocal.Tag = &tag
 	}
 }
 
+// fillUserLocalFromDialog sets a new room's mute and tag from its chat's entry
+// in the dialog list.
+func (tc *TelegramClient) fillUserLocalFromDialog(ctx context.Context, portal *bridgev2.Portal, info *bridgev2.ChatInfo) {
+	log := zerolog.Ctx(ctx)
+	_, chatID, topicID, err := ids.ParsePortalID(portal.ID)
+	if err != nil || topicID != 0 {
+		// Topic rooms get their mute from the topic, and forum spaces have none.
+		return
+	}
+	peer, err := tc.inputDialogPeer(ctx, portal)
+	if err != nil {
+		log.Err(err).Msg("Failed to get input peer to read new room's mute and tag")
+		return
+	}
+	var resp *tg.MessagesPeerDialogs
+	for retry, attempts := true, 0; retry && attempts < 5; attempts++ {
+		resp, err = tc.client.API().MessagesGetPeerDialogs(ctx, []tg.InputDialogPeerClass{peer})
+		retry, err = tgerr.FloodWait(ctx, err)
+	}
+	if err != nil {
+		log.Err(err).Msg("Failed to get dialog to read new room's mute and tag")
+		return
+	} else if len(resp.Dialogs) == 0 {
+		return
+	}
+	dialog, ok := resp.Dialogs[0].(userLocalDialog)
+	if !ok {
+		return
+	}
+	tc.fillUserLocalMeta(info, dialog)
+	for _, chat := range resp.Chats {
+		if channel, ok := chat.(*tg.Channel); ok && channel.ID == chatID && channel.Forum {
+			tc.applyGeneralTopicMute(ctx, channel.AsInputPeer(), info)
+		}
+	}
+}
+
+// applyGeneralTopicMute makes a forum's General room, which is the group's
+// portal, follow the General topic's own mute instead of the group's.
+func (tc *TelegramClient) applyGeneralTopicMute(ctx context.Context, channel *tg.InputPeerChannel, info *bridgev2.ChatInfo) {
+	resp, err := tc.client.API().MessagesGetForumTopicsByID(ctx, &tg.MessagesGetForumTopicsByIDRequest{
+		Peer:   channel,
+		Topics: []int{generalTopicID},
+	})
+	if err != nil {
+		zerolog.Ctx(ctx).Err(err).Msg("Failed to get General topic notification settings")
+		return
+	}
+	for _, t := range resp.Topics {
+		topic, ok := t.(*tg.ForumTopic)
+		if !ok || topic.ID != generalTopicID {
+			continue
+		} else if _, explicit := topic.NotifySettings.GetMuteUntil(); explicit {
+			if info.UserLocal == nil {
+				info.UserLocal = &bridgev2.UserLocalPortalInfo{}
+			}
+			info.UserLocal.MutedUntil = notifyMutedUntil(topic.NotifySettings)
+		}
+	}
+}
+
 // archiveFolderID is the peer folder Telegram uses for archived chats.
 const archiveFolderID = 1
 
-func isArchived(dialog any) bool {
+func isArchived(dialog tg.DialogClass) bool {
 	d, ok := dialog.(*tg.Dialog)
 	return ok && d.FolderID == archiveFolderID
 }
@@ -591,7 +649,17 @@ func (tc *TelegramClient) filterChannelParticipants(participants []tg.ChannelPar
 	}
 }
 
-func (tc *TelegramClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) (info *bridgev2.ChatInfo, err error) {
+func (tc *TelegramClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) (*bridgev2.ChatInfo, error) {
+	info, err := tc.getChatInfoWithRetry(ctx, portal)
+	if err == nil && portal.MXID == "" && info.UserLocal == nil && !tc.metadata.IsBot {
+		// Dialog syncs fill this in, but rooms created for other reasons, like a
+		// new message, would start without the chat's mute and tag.
+		tc.fillUserLocalFromDialog(ctx, portal, info)
+	}
+	return info, err
+}
+
+func (tc *TelegramClient) getChatInfoWithRetry(ctx context.Context, portal *bridgev2.Portal) (info *bridgev2.ChatInfo, err error) {
 	retry := true
 	for attempts := 0; retry && attempts < 5; attempts++ {
 		info, err = tc.getChatInfo(ctx, portal)
@@ -647,7 +715,11 @@ func (tc *TelegramClient) getChatInfo(ctx context.Context, portal *bridgev2.Port
 			tc.overrideChatInfoWithTopic(info, topic)
 			if !tc.metadata.IsBot {
 				settings, err := tc.forumTopicNotifySettings(ctx, &tg.InputPeerChannel{ChannelID: id, AccessHash: accessHash}, topic.NotifySettings)
-				if err != nil {
+				if _, isFloodWait := tgerr.AsFloodWait(err); isFloodWait {
+					// Let GetChatInfo wait and retry, since rooms are often only
+					// muted when they're created.
+					return nil, err
+				} else if err != nil {
 					zerolog.Ctx(ctx).Err(err).Msg("Failed to get forum topic notification settings")
 				} else {
 					info.UserLocal = &bridgev2.UserLocalPortalInfo{MutedUntil: notifyMutedUntil(settings)}
