@@ -1541,11 +1541,23 @@ func (tc *TelegramClient) transferEmojisToMatrix(ctx context.Context, customEmoj
 
 func (tc *TelegramClient) onNotifySettings(ctx context.Context, e tg.Entities, update *tg.UpdateNotifySettings) error {
 	var portalKey networkid.PortalKey
+	settings := update.NotifySettings
 	switch typedPeer := update.Peer.(type) {
 	case *tg.NotifyPeer:
 		portalKey = tc.makePortalKeyFromPeer(typedPeer.Peer, 0)
+		if channel, ok := typedPeer.Peer.(*tg.PeerChannel); ok {
+			tc.syncInheritedTopicMutes(ctx, channel.ChannelID, settings)
+		}
 	case *tg.NotifyForumTopic:
 		portalKey = tc.makePortalKeyFromPeer(typedPeer.Peer, typedPeer.TopMsgID)
+		peer, _, err := tc.inputPeerForPortalID(ctx, portalKey.ID)
+		if err == nil {
+			settings, err = tc.forumTopicNotifySettings(ctx, peer, settings)
+		}
+		if err != nil {
+			zerolog.Ctx(ctx).Err(err).Msg("Failed to get forum topic notification settings")
+			return nil
+		}
 	default:
 		zerolog.Ctx(ctx).Debug().
 			Type("peer_type", update.Peer).
@@ -1554,13 +1566,7 @@ func (tc *TelegramClient) onNotifySettings(ctx context.Context, e tg.Entities, u
 		return nil
 	}
 
-	var mutedUntil *time.Time
-	if mu, ok := update.NotifySettings.GetMuteUntil(); ok {
-		mutedUntil = ptr.Ptr(time.Unix(int64(mu), 0))
-	} else {
-		mutedUntil = &bridgev2.Unmuted
-	}
-
+	mutedUntil := notifyMutedUntil(settings)
 	res := tc.main.Bridge.QueueRemoteEvent(tc.userLogin, &simplevent.ChatInfoChange{
 		ChatInfoChange: &bridgev2.ChatInfoChange{
 			ChatInfo: &bridgev2.ChatInfo{
@@ -1580,6 +1586,87 @@ func (tc *TelegramClient) onNotifySettings(ctx context.Context, e tg.Entities, u
 		},
 	})
 	return resultToError(res)
+}
+
+func notifyMutedUntil(settings tg.PeerNotifySettings) *time.Time {
+	if mu, ok := settings.GetMuteUntil(); ok {
+		return ptr.Ptr(time.Unix(int64(mu), 0))
+	}
+	return &bridgev2.Unmuted
+}
+
+// forumTopicNotifySettings returns the settings a forum topic follows: its own
+// mute if it has one, otherwise the group's.
+func (tc *TelegramClient) forumTopicNotifySettings(ctx context.Context, channel tg.InputPeerClass, topic tg.PeerNotifySettings) (tg.PeerNotifySettings, error) {
+	if _, ok := topic.GetMuteUntil(); ok {
+		return topic, nil
+	}
+	group, err := tc.client.API().AccountGetNotifySettings(ctx, &tg.InputNotifyPeer{Peer: channel})
+	if err != nil {
+		return topic, err
+	}
+	return *group, nil
+}
+
+// syncInheritedTopicMutes applies a forum group's new notification settings
+// to the topic rooms that don't have a mute of their own.
+func (tc *TelegramClient) syncInheritedTopicMutes(ctx context.Context, channelID int64, group tg.PeerNotifySettings) {
+	log := zerolog.Ctx(ctx).With().Int64("channel_id", channelID).Logger()
+	children, err := tc.main.Bridge.GetChildPortals(ctx, tc.makePortalKeyFromID(ids.PeerTypeChannel, channelID, ids.TopicIDSpaceRoom))
+	if err != nil {
+		log.Err(err).Msg("Failed to get forum topic portals")
+		return
+	}
+	var topicIDs []int
+	for _, child := range children {
+		if _, _, topicID, err := ids.ParsePortalID(child.ID); err == nil && topicID > 0 && child.MXID != "" {
+			topicIDs = append(topicIDs, topicID)
+		}
+	}
+	if len(topicIDs) == 0 {
+		return
+	}
+	peer, _, err := tc.inputPeerForPortalID(ctx, ids.MakePortalID(ids.PeerTypeChannel, channelID))
+	if err != nil {
+		log.Err(err).Msg("Failed to get input peer for forum topics")
+		return
+	}
+	resp, err := APICallWithUpdates(ctx, tc, func() (*tg.MessagesForumTopics, error) {
+		return tc.client.API().MessagesGetForumTopicsByID(ctx, &tg.MessagesGetForumTopicsByIDRequest{Peer: peer, Topics: topicIDs})
+	})
+	if err != nil {
+		log.Err(err).Msg("Failed to get forum topics")
+		return
+	}
+	mutedUntil := notifyMutedUntil(group)
+	for _, t := range resp.Topics {
+		topic, ok := t.(*tg.ForumTopic)
+		if !ok {
+			continue
+		} else if _, explicit := topic.NotifySettings.GetMuteUntil(); explicit {
+			continue
+		}
+		res := tc.main.Bridge.QueueRemoteEvent(tc.userLogin, &simplevent.ChatInfoChange{
+			ChatInfoChange: &bridgev2.ChatInfoChange{
+				ChatInfo: &bridgev2.ChatInfo{
+					UserLocal: &bridgev2.UserLocalPortalInfo{MutedUntil: mutedUntil},
+				},
+			},
+			EventMeta: simplevent.EventMeta{
+				Type:      bridgev2.RemoteEventChatInfoChange,
+				PortalKey: tc.makePortalKeyFromID(ids.PeerTypeChannel, channelID, topic.ID),
+				LogContext: func(c zerolog.Context) zerolog.Context {
+					return c.
+						Str("tg_event", "updateNotifySettings").
+						Bool("inherited", true).
+						Time("muted_until", *mutedUntil)
+				},
+			},
+		})
+		if err = resultToError(res); err != nil {
+			log.Err(err).Int("topic_id", topic.ID).Msg("Failed to queue forum topic mute")
+		}
+	}
 }
 
 func (tc *TelegramClient) onPinnedDialogs(ctx context.Context, e tg.Entities, msg *tg.UpdatePinnedDialogs) error {

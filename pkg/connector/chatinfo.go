@@ -645,6 +645,14 @@ func (tc *TelegramClient) getChatInfo(ctx context.Context, portal *bridgev2.Port
 				return nil, err
 			}
 			tc.overrideChatInfoWithTopic(info, topic)
+			if !tc.metadata.IsBot {
+				settings, err := tc.forumTopicNotifySettings(ctx, &tg.InputPeerChannel{ChannelID: id, AccessHash: accessHash}, topic.NotifySettings)
+				if err != nil {
+					zerolog.Ctx(ctx).Err(err).Msg("Failed to get forum topic notification settings")
+				} else {
+					info.UserLocal = &bridgev2.UserLocalPortalInfo{MutedUntil: notifyMutedUntil(settings)}
+				}
+			}
 			err = tc.fillTopicMembers(ctx, id, mfm, info.Members)
 			if err != nil {
 				zerolog.Ctx(ctx).Err(err).Msg("Failed to get channel members")
