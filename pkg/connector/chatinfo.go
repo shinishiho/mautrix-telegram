@@ -379,9 +379,28 @@ func (tc *TelegramClient) fillUserLocalMeta(info *bridgev2.ChatInfo, dialog user
 	} else {
 		info.UserLocal.MutedUntil = &bridgev2.Unmuted
 	}
-	if dialog.GetPinned() {
-		info.UserLocal.Tag = ptr.Ptr(event.RoomTagFavourite)
+	if tag := dialogTag(dialog); tag != "" {
+		info.UserLocal.Tag = &tag
 	}
+}
+
+// archiveFolderID is the peer folder Telegram uses for archived chats.
+const archiveFolderID = 1
+
+func isArchived(dialog any) bool {
+	d, ok := dialog.(*tg.Dialog)
+	return ok && d.FolderID == archiveFolderID
+}
+
+// dialogTag maps archived chats to low priority and pinned chats to favourite.
+// Chats pinned inside the archive stay low priority.
+func dialogTag(dialog userLocalDialog) event.RoomTag {
+	if isArchived(dialog) {
+		return event.RoomTagLowPriority
+	} else if dialog.GetPinned() {
+		return event.RoomTagFavourite
+	}
+	return ""
 }
 
 type realFullChat interface {

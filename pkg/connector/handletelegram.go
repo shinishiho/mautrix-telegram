@@ -1098,6 +1098,10 @@ func (tc *TelegramClient) onUpdate(ctx context.Context, e tg.Entities, upd tg.Up
 		return tc.onNotifySettings(ctx, e, update)
 	case *tg.UpdatePinnedDialogs:
 		return tc.onPinnedDialogs(ctx, e, update)
+	case *tg.UpdateDialogPinned:
+		return tc.onDialogPinned(ctx, update)
+	case *tg.UpdateFolderPeers:
+		return tc.onFolderPeers(ctx, update)
 	case *tg.UpdateChatDefaultBannedRights:
 		return tc.onChatDefaultBannedRights(ctx, e, update)
 	case *tg.UpdatePeerBlocked:
@@ -1579,6 +1583,24 @@ func (tc *TelegramClient) onNotifySettings(ctx context.Context, e tg.Entities, u
 }
 
 func (tc *TelegramClient) onPinnedDialogs(ctx context.Context, e tg.Entities, msg *tg.UpdatePinnedDialogs) error {
+	if msg.FolderID != 0 {
+		// Pins inside the archive aren't bridged, archived chats are low priority.
+		return nil
+	}
+	order, ok := msg.GetOrder()
+	if !ok {
+		// Telegram omits the order when the client should refetch it.
+		pinned, err := tc.client.API().MessagesGetPinnedDialogs(ctx, 0)
+		if err != nil {
+			return err
+		}
+		for _, d := range pinned.Dialogs {
+			if dialog, ok := d.(*tg.Dialog); ok {
+				order = append(order, &tg.DialogPeer{Peer: dialog.Peer})
+			}
+		}
+	}
+
 	needsUnpinning := map[networkid.PortalKey]struct{}{}
 	for _, portalID := range tc.metadata.PinnedDialogs {
 		pt, id, _, err := ids.ParsePortalID(portalID)
@@ -1589,7 +1611,7 @@ func (tc *TelegramClient) onPinnedDialogs(ctx context.Context, e tg.Entities, ms
 	}
 	tc.metadata.PinnedDialogs = nil
 
-	for _, d := range msg.Order {
+	for _, d := range order {
 		dialog, ok := d.(*tg.DialogPeer)
 		if !ok {
 			continue
@@ -1621,32 +1643,79 @@ func (tc *TelegramClient) onPinnedDialogs(ctx context.Context, e tg.Entities, ms
 		}
 	}
 
-	var empty event.RoomTag
+	// Unpinned chats may have been archived, so check their current state.
 	for portalKey := range needsUnpinning {
-		res := tc.main.Bridge.QueueRemoteEvent(tc.userLogin, &simplevent.ChatInfoChange{
-			ChatInfoChange: &bridgev2.ChatInfoChange{
-				ChatInfo: &bridgev2.ChatInfo{
-					UserLocal: &bridgev2.UserLocalPortalInfo{
-						Tag: &empty,
-					},
-				},
-			},
-			EventMeta: simplevent.EventMeta{
-				Type:      bridgev2.RemoteEventChatInfoChange,
-				PortalKey: portalKey,
-				LogContext: func(c zerolog.Context) zerolog.Context {
-					return c.
-						Str("tg_event", "updatePinnedDialogs").
-						Bool("pinned", false)
-				},
-			},
-		})
-		if err := resultToError(res); err != nil {
-			return err
-		}
+		tc.syncDialogTags(ctx, portalKey)
 	}
 
 	return tc.userLogin.Save(ctx)
+}
+
+func (tc *TelegramClient) onDialogPinned(ctx context.Context, update *tg.UpdateDialogPinned) error {
+	dialog, ok := update.Peer.(*tg.DialogPeer)
+	if !ok || update.FolderID != 0 {
+		// Pinned folders and pins inside the archive aren't bridged.
+		return nil
+	}
+	portalKey := tc.makePortalKeyFromPeer(dialog.Peer, 0)
+	tc.metadata.PinnedDialogs = slices.DeleteFunc(tc.metadata.PinnedDialogs, func(id networkid.PortalID) bool {
+		return id == portalKey.ID
+	})
+	if update.Pinned {
+		tc.metadata.PinnedDialogs = append(tc.metadata.PinnedDialogs, portalKey.ID)
+	}
+	tc.syncDialogTags(ctx, portalKey)
+	return tc.userLogin.Save(ctx)
+}
+
+func (tc *TelegramClient) onFolderPeers(ctx context.Context, update *tg.UpdateFolderPeers) error {
+	for _, folderPeer := range update.FolderPeers {
+		tc.syncDialogTags(ctx, tc.makePortalKeyFromPeer(folderPeer.Peer, 0))
+	}
+	return nil
+}
+
+// syncDialogTags bridges the current archive and pin state of the given chats.
+// Telegram sends folder and pin changes as separate updates in no particular
+// order, so the state is read back rather than derived from a single update.
+func (tc *TelegramClient) syncDialogTags(ctx context.Context, portalKeys ...networkid.PortalKey) {
+	for _, portalKey := range portalKeys {
+		log := zerolog.Ctx(ctx).With().Str("portal_id", string(portalKey.ID)).Logger()
+		peer, _, err := tc.inputPeerForPortalID(ctx, portalKey.ID)
+		if err != nil {
+			log.Err(err).Msg("Failed to get input peer to sync room tag")
+			continue
+		}
+		resp, err := tc.client.API().MessagesGetPeerDialogs(ctx, []tg.InputDialogPeerClass{&tg.InputDialogPeer{Peer: peer}})
+		if err != nil {
+			log.Err(err).Msg("Failed to get dialog to sync room tag")
+			continue
+		}
+		for _, d := range resp.Dialogs {
+			dialog, ok := d.(*tg.Dialog)
+			if !ok {
+				continue
+			}
+			tag := dialogTag(dialog)
+			res := tc.main.Bridge.QueueRemoteEvent(tc.userLogin, &simplevent.ChatInfoChange{
+				ChatInfoChange: &bridgev2.ChatInfoChange{
+					ChatInfo: &bridgev2.ChatInfo{
+						UserLocal: &bridgev2.UserLocalPortalInfo{Tag: &tag},
+					},
+				},
+				EventMeta: simplevent.EventMeta{
+					Type:      bridgev2.RemoteEventChatInfoChange,
+					PortalKey: portalKey,
+					LogContext: func(c zerolog.Context) zerolog.Context {
+						return c.Str("tg_event", "dialogTagSync").Str("tag", string(tag))
+					},
+				},
+			})
+			if err = resultToError(res); err != nil {
+				log.Err(err).Msg("Failed to queue room tag sync")
+			}
+		}
+	}
 }
 
 func (tc *TelegramClient) onChatDefaultBannedRights(ctx context.Context, entities tg.Entities, update *tg.UpdateChatDefaultBannedRights) error {
